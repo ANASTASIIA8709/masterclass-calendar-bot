@@ -1,250 +1,215 @@
 """
-Бот-расписание: клиент выбирает дату и время, запись сохраняется в Google Calendar.
-Показывает свободные слоты на ближайшие 2 недели.
-Утренний дайджест в 9:05 MSK.
+Личный ИИ-секретарь с Google Календарём.
+Пишешь «встреча с Ивановым в пятницу в 15:00» — бот добавляет в Google Calendar.
+Спрашиваешь «что у меня сегодня?» — показывает расписание.
 
 Переменные окружения:
-  BOT_TOKEN           - токен от @BotFather
-  OWNER_ID            - ваш Telegram ID для утреннего дайджеста
-  CALENDAR_ID         - ID календаря Google (или 'primary')
-  GOOGLE_CREDENTIALS_JSON - JSON service account в одну строку
-  SLOTS_PER_DAY       - слоты через запятую, например: 10:00,14:00,17:00
-  AVAILABLE_DAYS      - дни недели через запятую 0=пн..6=вс, например: 0,1,2,3,4
-
-TODO: добавьте Service Account как редактора в настройках вашего Google Calendar.
+  BOT_TOKEN                — токен от @BotFather (обязательно)
+  OWNER_ID                 — твой Telegram ID (обязательно)
+  ANTHROPIC_API_KEY        — ключ Claude API с console.anthropic.com
+  CALENDAR_ID              — ID календаря или слово primary
+  GOOGLE_CREDENTIALS_JSON  — JSON сервисного аккаунта одной строкой
 """
 
-import asyncio, os, json, logging
-from datetime import datetime, timedelta, date, timezone
-from aiogram import Bot, Dispatcher, types, F
+import asyncio, json, os, logging
+from datetime import datetime, timedelta, timezone
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+import anthropic
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-BOT_TOKEN        = os.environ["BOT_TOKEN"]
-OWNER_ID         = int(os.environ.get("OWNER_ID", "0"))
-CALENDAR_ID      = os.environ.get("CALENDAR_ID", "primary")
-CREDS_JSON       = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
-_slots_env       = os.environ.get("SLOTS_PER_DAY", "10:00,13:00,16:00")
-SLOTS_PER_DAY    = [s.strip() for s in _slots_env.split(",") if s.strip()]
-_days_env        = os.environ.get("AVAILABLE_DAYS", "0,1,2,3,4")
-AVAILABLE_DAYS   = [int(d.strip()) for d in _days_env.split(",") if d.strip()]
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+OWNER_ID    = int(os.environ.get("OWNER_ID", "0"))
+CLAUDE_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+CALENDAR_ID = os.environ.get("CALENDAR_ID", "primary")
+CREDS_JSON  = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
 
 MSK = timezone(timedelta(hours=3))
-
-
-def get_calendar_service():
-    if not CREDS_JSON:
-        raise ValueError("GOOGLE_CREDENTIALS_JSON не задан")
-    creds_data = json.loads(CREDS_JSON)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_data,
-        scopes=["https://www.googleapis.com/auth/calendar"],
-    )
-    return build("calendar", "v3", credentials=creds)
-
-
-def free_slots(days_ahead: int = 14) -> list[tuple[date, str]]:
-    """Возвращает слоты, не занятые в Google Calendar."""
-    svc   = get_calendar_service()
-    today = date.today()
-    end   = today + timedelta(days=days_ahead)
-
-    events = svc.events().list(
-        calendarId=CALENDAR_ID,
-        timeMin=today.isoformat() + "T00:00:00Z",
-        timeMax=end.isoformat()   + "T23:59:59Z",
-        singleEvents=True,
-    ).execute().get("items", [])
-
-    busy = {
-        (e["start"].get("dateTime", "")[:10],
-         e["start"].get("dateTime", "")[11:16])
-        for e in events
-    }
-
-    slots = []
-    d = today + timedelta(days=1)
-    while d <= end:
-        if d.weekday() in AVAILABLE_DAYS:
-            for t in SLOTS_PER_DAY:
-                if (str(d), t) not in busy:
-                    slots.append((d, t))
-        d += timedelta(days=1)
-    return slots[:20]
-
-
-def get_today_events() -> list[dict]:
-    svc   = get_calendar_service()
-    today = date.today()
-    events = svc.events().list(
-        calendarId=CALENDAR_ID,
-        timeMin=today.isoformat() + "T00:00:00+03:00",
-        timeMax=today.isoformat() + "T23:59:59+03:00",
-        singleEvents=True,
-        orderBy="startTime",
-    ).execute().get("items", [])
-    return events
-
-
-def get_week_events() -> list[dict]:
-    svc   = get_calendar_service()
-    today = date.today()
-    week_end = today + timedelta(days=7)
-    events = svc.events().list(
-        calendarId=CALENDAR_ID,
-        timeMin=today.isoformat() + "T00:00:00+03:00",
-        timeMax=week_end.isoformat() + "T23:59:59+03:00",
-        singleEvents=True,
-        orderBy="startTime",
-    ).execute().get("items", [])
-    return events
-
-
-def create_event(dt_str: str, name: str, phone: str):
-    svc   = get_calendar_service()
-    start = datetime.fromisoformat(dt_str)
-    end   = start + timedelta(hours=1)
-    svc.events().insert(
-        calendarId=CALENDAR_ID,
-        body={
-            "summary":     f"Запись: {name}",
-            "description": f"Телефон: {phone}",
-            "start": {"dateTime": start.isoformat(), "timeZone": "Europe/Moscow"},
-            "end":   {"dateTime": end.isoformat(),   "timeZone": "Europe/Moscow"},
-        },
-    ).execute()
-
-
-def format_events(events: list[dict]) -> str:
-    if not events:
-        return "Событий нет."
-    lines = []
-    for e in events:
-        summary = e.get("summary", "(без названия)")
-        start = e["start"].get("dateTime", e["start"].get("date", ""))
-        if "T" in start:
-            dt = datetime.fromisoformat(start)
-            time_str = dt.strftime("%d.%m %H:%M")
-        else:
-            time_str = start
-        lines.append(f"• {time_str} - {summary}")
-    return "\n".join(lines)
-
+WEEKDAYS_RU = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp  = Dispatcher()
 
 
-class Book(StatesGroup):
-    slot  = State()
-    name  = State()
-    phone = State()
+# ── Google Calendar ──────────────────────────────────────────
 
+def _cal():
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(CREDS_JSON),
+        scopes=["https://www.googleapis.com/auth/calendar"]
+    )
+    return build("calendar", "v3", credentials=creds)
+
+def now_msk() -> datetime:
+    return datetime.now(MSK)
+
+def create_event(title: str, date: str, time: str = None, description: str = None) -> None:
+    if time:
+        start = {"dateTime": f"{date}T{time}:00", "timeZone": "Europe/Moscow"}
+        end_dt = datetime.fromisoformat(f"{date}T{time}:00") + timedelta(hours=1)
+        end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "Europe/Moscow"}
+    else:
+        start = {"date": date}
+        end   = {"date": (datetime.fromisoformat(date) + timedelta(days=1)).strftime("%Y-%m-%d")}
+    body = {"summary": title, "start": start, "end": end}
+    if description:
+        body["description"] = description
+    _cal().events().insert(calendarId=CALENDAR_ID, body=body).execute()
+
+def get_events(date: str, days: int = 1) -> list:
+    start = datetime.fromisoformat(date).replace(tzinfo=MSK)
+    end   = start + timedelta(days=days)
+    result = _cal().events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=start.isoformat(), timeMax=end.isoformat(),
+        singleEvents=True, orderBy="startTime", timeZone="Europe/Moscow"
+    ).execute()
+    return result.get("items", [])
+
+def fmt_event(ev: dict) -> str:
+    start = ev.get("start", {})
+    t = datetime.fromisoformat(start["dateTime"]).strftime("%H:%M") if "dateTime" in start else "весь день"
+    return f"• {t} — {ev.get('summary', '(без названия)')}"
+
+MONTHS_RU = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
+             7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
+
+def fmt_date_ru(date: str) -> str:
+    d = datetime.fromisoformat(date)
+    return f"{d.day} {MONTHS_RU[d.month]}"
+
+
+# ── Claude NL-парсер ─────────────────────────────────────────
+
+def parse_with_claude(text: str) -> dict:
+    """Свободный текст → JSON с action/title/date/time."""
+    now  = now_msk()
+    today = now.strftime("%Y-%m-%d")
+    wd    = WEEKDAYS_RU[now.weekday()]
+
+    def nxt(wd_num: int) -> str:
+        days = (wd_num - now.weekday() - 1) % 7 + 1
+        return (now + timedelta(days=days)).strftime("%Y-%m-%d")
+
+    prompt = f"""Сегодня {today} ({wd}), время {now.strftime("%H:%M")} МСК.
+Завтра: {(now+timedelta(days=1)).strftime("%Y-%m-%d")}.
+Ближайшие дни: пн={nxt(0)}, вт={nxt(1)}, ср={nxt(2)}, чт={nxt(3)}, пт={nxt(4)}, сб={nxt(5)}, вс={nxt(6)}.
+
+Верни ТОЛЬКО JSON, без пояснений.
+Если это добавление события:
+  {{"action":"create","title":"название","date":"YYYY-MM-DD","time":"HH:MM или null","description":"заметка или null"}}
+Если это просмотр расписания (что сегодня / завтра / на неделе и т.п.):
+  {{"action":"list","date":"YYYY-MM-DD","days":1}}
+  (days=7 если «на неделе»)
+
+Сообщение: {text}"""
+
+    client = anthropic.Anthropic(api_key=CLAUDE_KEY)
+    resp   = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1].lstrip("json").strip().rstrip("```").strip()
+    return json.loads(raw)
+
+
+# ── Хелперы ──────────────────────────────────────────────────
+
+def only_owner(msg: types.Message) -> bool:
+    return OWNER_ID == 0 or msg.from_user.id == OWNER_ID
+
+async def show_schedule(msg: types.Message, date: str, days: int, label: str):
+    if not CREDS_JSON:
+        await msg.answer("⚙️ Задай GOOGLE_CREDENTIALS_JSON и CALENDAR_ID в переменных Railway.")
+        return
+    try:
+        events = get_events(date, days)
+        if not events:
+            await msg.answer(f"📅 Событий {label} нет.")
+            return
+        lines = [fmt_event(e) for e in events]
+        await msg.answer(f"📅 <b>Расписание {label}:</b>\n\n" + "\n".join(lines))
+    except Exception as e:
+        await msg.answer(f"Ошибка Calendar: {e}")
+
+
+# ── Хендлеры ─────────────────────────────────────────────────
 
 @dp.message(CommandStart())
-async def start(msg: types.Message, state: FSMContext):
-    try:
-        slots = free_slots()
-    except Exception as e:
-        await msg.answer(f"⚠️ Ошибка подключения к Calendar: {e}\n\nПроверь переменную GOOGLE_CREDENTIALS_JSON.")
-        return
-    if not slots:
-        await msg.answer("Свободных слотов пока нет. Напиши мне напрямую.")
-        return
-    await state.update_data(slots=[(str(d), t) for d, t in slots])
-    kb = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(
-            text=f"{d.strftime('%d.%m %a')} в {t}",
-            callback_data=f"slot:{i}",
-        )]
-        for i, (d, t) in enumerate(slots)
-    ])
-    await state.set_state(Book.slot)
-    await msg.answer("Выбери удобное время:", reply_markup=kb)
-
+async def cmd_start(msg: types.Message):
+    if not only_owner(msg): return
+    await msg.answer(
+        "👋 Привет! Пиши мне как в чат:\n\n"
+        "— <i>встреча с Ивановым в пятницу в 14:00</i>\n"
+        "— <i>звонок в банк завтра в 10</i>\n"
+        "— <i>что у меня сегодня?</i>\n"
+        "— <i>что на этой неделе?</i>\n\n"
+        "Или команды: /today /tomorrow /week"
+    )
 
 @dp.message(Command("today"))
 async def cmd_today(msg: types.Message):
-    try:
-        events = get_today_events()
-        text = "📅 <b>Сегодня:</b>\n\n" + format_events(events)
-    except Exception as e:
-        text = f"❌ Ошибка: {e}"
-    await msg.answer(text)
+    if not only_owner(msg): return
+    await show_schedule(msg, now_msk().strftime("%Y-%m-%d"), 1, "сегодня")
 
+@dp.message(Command("tomorrow"))
+async def cmd_tomorrow(msg: types.Message):
+    if not only_owner(msg): return
+    await show_schedule(msg, (now_msk()+timedelta(days=1)).strftime("%Y-%m-%d"), 1, "завтра")
 
 @dp.message(Command("week"))
 async def cmd_week(msg: types.Message):
-    try:
-        events = get_week_events()
-        text = "📅 <b>Ближайшая неделя:</b>\n\n" + format_events(events)
-    except Exception as e:
-        text = f"❌ Ошибка: {e}"
-    await msg.answer(text)
+    if not only_owner(msg): return
+    await show_schedule(msg, now_msk().strftime("%Y-%m-%d"), 7, "на этой неделе")
 
-
-@dp.callback_query(Book.slot, F.data.startswith("slot:"))
-async def pick_slot(call: types.CallbackQuery, state: FSMContext):
-    idx = int(call.data.split(":")[1])
-    data = await state.get_data()
-    chosen = data["slots"][idx]
-    await state.update_data(chosen=chosen)
-    await state.set_state(Book.name)
-    await call.message.answer(f"Выбрано: {chosen[0]} в {chosen[1]}\n\nКак тебя зовут?")
-    await call.answer()
-
-
-@dp.message(Book.name)
-async def get_name(msg: types.Message, state: FSMContext):
-    await state.update_data(name=msg.text)
-    await state.set_state(Book.phone)
-    await msg.answer("Телефон для подтверждения:")
-
-
-@dp.message(Book.phone)
-async def get_phone(msg: types.Message, state: FSMContext):
-    data = await state.get_data()
-    await state.clear()
-    d, t = data["chosen"]
-    dt_str = f"{d}T{t}:00+03:00"
-    try:
-        create_event(dt_str, data["name"], msg.text)
-        await msg.answer(
-            f"✅ Записала!\n{d} в {t}\nИмя: {data['name']}\n"
-            "Жди подтверждения - напишу за день до встречи."
-        )
-    except Exception as e:
-        await msg.answer(f"Ошибка при записи: {e}")
-
-
-async def morning_digest():
-    """Утренний дайджест в 9:05 MSK."""
-    if not OWNER_ID:
+@dp.message()
+async def handle_text(msg: types.Message):
+    if not only_owner(msg): return
+    if not CLAUDE_KEY:
+        await msg.answer("⚙️ Задай ANTHROPIC_API_KEY в переменных Railway.")
         return
-    while True:
-        now = datetime.now(MSK)
-        # Следующий 9:05 MSK
-        target = now.replace(hour=9, minute=5, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        try:
-            events = get_today_events()
-            text = "☀️ <b>Доброе утро! Расписание на сегодня:</b>\n\n" + format_events(events)
-            await bot.send_message(OWNER_ID, text)
-        except Exception as e:
-            logging.error(f"Morning digest error: {e}")
+    if not CREDS_JSON:
+        await msg.answer("⚙️ Задай GOOGLE_CREDENTIALS_JSON и CALENDAR_ID в переменных Railway.")
+        return
+    try:
+        parsed = parse_with_claude(msg.text or "")
+        action = parsed.get("action")
+
+        if action == "create":
+            title = parsed["title"]
+            date  = parsed["date"]
+            time  = parsed.get("time")
+            desc  = parsed.get("description")
+            create_event(title, date, time, desc)
+            date_ru = fmt_date_ru(date)
+            suffix  = f", {time}" if time else ""
+            await msg.answer(f"✅ Добавлено: <b>{title}</b>\n📅 {date_ru}{suffix}")
+
+        elif action == "list":
+            date = parsed.get("date", now_msk().strftime("%Y-%m-%d"))
+            days = int(parsed.get("days", 1))
+            await show_schedule(msg, date, days, "на запрошенный период")
+
+        else:
+            await msg.answer("Не понял. Попробуй: «встреча завтра в 15:00» или «что сегодня?»")
+
+    except json.JSONDecodeError:
+        await msg.answer("Не смог разобрать запрос — попробуй иначе.")
+    except Exception as e:
+        logger.error(f"handle_text error: {e}")
+        await msg.answer(f"Ошибка: {e}")
 
 
 async def main():
-    asyncio.create_task(morning_digest())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
